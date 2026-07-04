@@ -12,6 +12,79 @@ COARSE_CLASSES = {"+125", "+71", "-125+71"}
 FINE_CLASSES = {"-10"}
 
 
+def _context_preferences(kpi: str, constraints: str = "") -> dict[str, set[str]]:
+    text = f"{kpi} {constraints}".lower().replace("ё", "е").replace("_", " ")
+    elements: set[str] = set()
+    if "элемент 28" in text or "элемента 28" in text or "element 28" in text:
+        elements.add("element_28")
+    if "элемент 29" in text or "элемента 29" in text or "element 29" in text:
+        elements.add("element_29")
+
+    size_focus: set[str] = set()
+    if any(term in text for term in ("тонк", "мелк", "-10", "шлам")):
+        size_focus.add("fine")
+    if any(term in text for term in ("груб", "крупн", "+125", "+71", "доизмельч", "классификац", "раскрыт")):
+        size_focus.add("coarse")
+
+    process_focus: set[str] = set()
+    if any(term in text for term in ("флотац", "реагент", "пульп", "агитац", "вод")):
+        process_focus.add("flotation")
+    if any(term in text for term in ("классификац", "доизмельч", "гидроциклон", "раскрыт")):
+        process_focus.add("classification")
+    return {"elements": elements, "size": size_focus, "process": process_focus}
+
+
+def _observation_context_boost(obs: TailingsObservation, zone_type: str, preferences: dict[str, set[str]]) -> float:
+    boost = 0.0
+    elements = preferences["elements"]
+    if elements:
+        boost += 0.2 if obs.element in elements else -0.14
+
+    size_focus = preferences["size"]
+    is_fine = obs.particle_size_class in FINE_CLASSES or zone_type == "fine_particle_loss"
+    is_coarse = obs.particle_size_class in COARSE_CLASSES or zone_type == "coarse_locked_loss"
+    if "fine" in size_focus:
+        boost += 0.22 if is_fine else -0.1
+    if "coarse" in size_focus:
+        boost += 0.22 if is_coarse else -0.1
+
+    process_focus = preferences["process"]
+    if "flotation" in process_focus:
+        boost += 0.1 if is_fine or zone_type == "missing_process_link" else -0.04
+    if "classification" in process_focus:
+        boost += 0.1 if is_coarse or zone_type == "missing_process_link" else -0.04
+    return boost
+
+
+def _expert_context_boost(item: ExpertHypothesis, preferences: dict[str, set[str]]) -> float:
+    text = item.text.lower().replace("ё", "е").replace("_", " ")
+    boost = 0.0
+    if "element_28" in preferences["elements"] and ("элемент 28" in text or "element 28" in text or "ni" in text):
+        boost += 0.15
+    if "element_29" in preferences["elements"] and ("элемент 29" in text or "element 29" in text or "cu" in text):
+        boost += 0.15
+    if "fine" in preferences["size"] and any(term in text for term in ("тонк", "-10", "шлам")):
+        boost += 0.12
+    if "coarse" in preferences["size"] and any(term in text for term in ("груб", "+125", "+71", "доизмельч", "классификац")):
+        boost += 0.12
+    return boost
+
+
+def _clamp(value: float, low: float = 0.2, high: float = 1.0) -> float:
+    return min(high, max(low, value))
+
+
+def _finalize_zones(zones: list[UncertaintyZone]) -> list[UncertaintyZone]:
+    for zone in zones:
+        zone.priority = round(
+            0.5 * zone.kpi_relevance
+            + 0.35 * zone.gap_severity
+            + 0.15 * max(zone.contradiction_strength, zone.indirect_mechanism_strength),
+            3,
+        )
+    return sorted(zones, key=lambda item: item.priority, reverse=True)
+
+
 def build_tailings_coverage_matrix(observations: list[TailingsObservation]) -> pd.DataFrame:
     rows = []
     grouped: dict[tuple[str, str, str, str], list[TailingsObservation]] = defaultdict(list)
@@ -45,18 +118,25 @@ def find_tailings_uncertainty_zones(
     observations: list[TailingsObservation],
     expert_hypotheses: list[ExpertHypothesis],
     kpi: str,
+    constraints: str = "",
 ) -> list[UncertaintyZone]:
     zones: list[UncertaintyZone] = []
+    preferences = _context_preferences(kpi, constraints)
     distributions = [
         obs for obs in observations if obs.extractable is None and obs.loss_mass_t is not None and obs.particle_size_class
     ]
     extractable = [
         obs for obs in observations if obs.extractable is True and obs.loss_mass_t is not None and obs.particle_size_class
     ]
-    for obs in sorted(extractable, key=lambda item: item.loss_mass_t or 0, reverse=True)[:8]:
+    def extractable_key(item: TailingsObservation) -> tuple[float, float]:
+        zone_type = "coarse_locked_loss" if item.particle_size_class in COARSE_CLASSES else "fine_particle_loss"
+        return (_observation_context_boost(item, zone_type, preferences), item.loss_mass_t or 0)
+
+    for obs in sorted(extractable, key=extractable_key, reverse=True)[:8]:
         stage = "измельчение" if obs.particle_size_class in COARSE_CLASSES else "флотация"
         equipment = "гидроциклон" if obs.particle_size_class in COARSE_CLASSES else "флотомашина"
         zone_type = "coarse_locked_loss" if obs.particle_size_class in COARSE_CLASSES else "fine_particle_loss"
+        context_boost = _observation_context_boost(obs, zone_type, preferences)
         zones.append(
             UncertaintyZone(
                 id=_zone_id("TAIL", zones),
@@ -71,11 +151,16 @@ def find_tailings_uncertainty_zones(
                 source_links=[obs.source_file, obs.row_ref or ""],
                 why_it_matters="Это технологически доступная часть потерь: ее можно пытаться вернуть изменением классификации, измельчения или флотации.",
                 suggested_check=f"Проверить режим {stage} / {equipment} на классе {obs.particle_size_class} с измерением потерь {obs.element}.",
-                kpi_relevance=0.95,
-                gap_severity=min(1.0, 0.55 + (obs.loss_mass_t or 0) / 9000),
+                kpi_relevance=_clamp(0.78 + context_boost),
+                gap_severity=_clamp(0.55 + (obs.loss_mass_t or 0) / 9000 + max(context_boost, 0) * 0.25),
             )
         )
-    for obs in sorted(distributions, key=lambda item: item.loss_mass_t or 0, reverse=True)[:6]:
+    for obs in sorted(
+        distributions,
+        key=lambda item: (_observation_context_boost(item, "missing_process_link", preferences), item.loss_mass_t or 0),
+        reverse=True,
+    )[:6]:
+        context_boost = _observation_context_boost(obs, "missing_process_link", preferences)
         zones.append(
             UncertaintyZone(
                 id=_zone_id("LINK", zones),
@@ -89,8 +174,8 @@ def find_tailings_uncertainty_zones(
                 source_links=[obs.source_file, obs.row_ref or ""],
                 why_it_matters="Без связи с узлом схемы гипотеза остается слишком общей; это главный пробел для проверки на фабрике.",
                 suggested_check="Привязать пик потерь к участку схемы: классификация, измельчение, основная или контрольная флотация.",
-                kpi_relevance=0.88,
-                gap_severity=0.78,
+                kpi_relevance=_clamp(0.72 + context_boost),
+                gap_severity=_clamp(0.68 + max(context_boost, 0) * 0.2),
             )
         )
     by_factory_element: dict[tuple[str, str], list[TailingsObservation]] = defaultdict(list)
@@ -118,7 +203,8 @@ def find_tailings_uncertainty_zones(
                     contradiction_strength=0.72,
                 )
             )
-    for item in expert_hypotheses[:8]:
+    for item in sorted(expert_hypotheses, key=lambda hyp: _expert_context_boost(hyp, preferences), reverse=True)[:8]:
+        context_boost = _expert_context_boost(item, preferences)
         zones.append(
             UncertaintyZone(
                 id=_zone_id("EXP", zones),
@@ -129,8 +215,8 @@ def find_tailings_uncertainty_zones(
                 source_links=[item.source_file],
                 why_it_matters="Экспертная идея полезна как ориентир, но должна быть проверена через потери по классам и минимальный эксперимент.",
                 suggested_check="Сопоставить экспертную идею с top-loss классами и проверить на малом технологическом окне.",
-                kpi_relevance=0.76,
-                gap_severity=0.58,
+                kpi_relevance=_clamp(0.62 + context_boost),
+                gap_severity=_clamp(0.52 + context_boost * 0.4),
             )
         )
-    return zones
+    return _finalize_zones(zones)
