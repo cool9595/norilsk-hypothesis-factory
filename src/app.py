@@ -270,12 +270,24 @@ def _parse_uploads(st, enabled: bool) -> list:
     return docs
 
 
-def _run(st, kpi: str, constraints: str, uploaded_docs: list) -> PipelineResult:
-    key = ("pipeline", kpi, constraints, tuple(doc.title for doc in uploaded_docs))
-    if "last_key" not in st.session_state or st.session_state.last_key != key:
-        st.session_state.last_key = key
-        st.session_state.result = run_pipeline(kpi, constraints, uploaded_docs or None)
+def _run(st, kpi: str, constraints: str, uploaded_docs: list, weights: dict[str, float]) -> PipelineResult:
+    st.session_state.result = run_pipeline(kpi, constraints, uploaded_docs or None)
+    st.session_state.active_kpi = kpi
+    st.session_state.active_constraints = constraints
+    st.session_state.active_uploaded_titles = [doc.title for doc in uploaded_docs]
+    st.session_state.active_weights = dict(weights)
     return st.session_state.result
+
+
+def _draft_changed(st, kpi: str, constraints: str, uploaded_docs: list, weights: dict[str, float]) -> bool:
+    if "result" not in st.session_state:
+        return False
+    return (
+        st.session_state.get("active_kpi") != kpi
+        or st.session_state.get("active_constraints") != constraints
+        or st.session_state.get("active_uploaded_titles", []) != [doc.title for doc in uploaded_docs]
+        or st.session_state.get("active_weights", {}) != weights
+    )
 
 
 def task_setup_tab(st, result: PipelineResult, weights: dict[str, float], kpi: str, constraints: str) -> None:
@@ -290,6 +302,7 @@ def task_setup_tab(st, result: PipelineResult, weights: dict[str, float], kpi: s
         c5.metric("Наблюдения по хвостам", len(result.tailings_observations))
         c6.metric("Экспертные гипотезы", len(result.expert_hypotheses or []))
         c7.metric("PNG-схемы и регламенты", len(result.images or []))
+    st.caption("Показаны параметры последнего запуска пайплайна.")
     st.text_area("Текущий целевой показатель", _polish_sentence(kpi), disabled=True)
     st.text_area("Ограничения", _polish_sentence(constraints), disabled=True)
     st.dataframe(pd.DataFrame([{WEIGHT_LABELS.get(key, key): value for key, value in weights.items()}]), use_container_width=True, hide_index=True)
@@ -755,11 +768,18 @@ def main() -> None:
         uploaded_docs = _parse_uploads(st, enable_uploads)
         weights = _weights_sidebar(st)
         run_button = st.button("Запустить обработку", type="primary", use_container_width=True)
+        st.caption("Изменения KPI, ограничений, файлов и весов применятся после запуска обработки.")
 
     if run_button or "result" not in st.session_state:
-        result = _run(st, kpi, constraints, uploaded_docs)
+        result = _run(st, kpi, constraints, uploaded_docs, weights)
     else:
         result = st.session_state.result
+
+    active_kpi = st.session_state.get("active_kpi", kpi)
+    active_constraints = st.session_state.get("active_constraints", constraints)
+    active_weights = st.session_state.get("active_weights", weights)
+    if _draft_changed(st, kpi, constraints, uploaded_docs, weights):
+        st.info("Параметры в боковой панели изменены, но результат еще не пересчитан. Нажмите «Запустить обработку», чтобы применить изменения.")
 
     tabs = st.tabs(
         [
@@ -777,7 +797,7 @@ def main() -> None:
         ]
     )
     with tabs[0]:
-        task_setup_tab(st, result, weights, kpi, constraints)
+        task_setup_tab(st, result, active_weights, active_kpi, active_constraints)
     with tabs[1]:
         tz_check_tab(st, result)
     with tabs[2]:
@@ -793,11 +813,11 @@ def main() -> None:
     with tabs[7]:
         zones_tab(st, result)
     with tabs[8]:
-        hypotheses_tab(st, result, weights)
+        hypotheses_tab(st, result, active_weights)
     with tabs[9]:
         graph_tab(st, result)
     with tabs[10]:
-        review_export_tab(st, result, weights)
+        review_export_tab(st, result, active_weights)
 
 
 if __name__ == "__main__":
