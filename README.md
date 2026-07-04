@@ -11,13 +11,16 @@
 02_Analysis/   Тесты и проверочные сценарии.
 03_Results/    Описание ожидаемых результатов и места для экспортов.
 src/           Код Streamlit-приложения и Python-пакет.
+Dockerfile        Опциональный запуск через Docker.
+requirements.txt  Python-зависимости.
+pytest.ini        Настройки запуска тестов.
 ```
 
 ## Запуск
-
+Команды нужно выполнять из корня репозитория:
 ```bash
-pip install -r requirements.txt
-streamlit run src/app.py
+python -m pip install -r requirements.txt
+python -m streamlit run src/app.py
 ```
 
 После запуска открыть:
